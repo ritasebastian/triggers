@@ -87,5 +87,38 @@ ON INSERT or UPDATE on MODERN_EXT_BANK_ACCOUNT
 
      - If `operation_type` is `PRIMARY_UPDATE` and `Is_Primary = 1`:
        - Similar logic to insert case: unset previous primary, set new primary, sync log
+   
+
+  ON INSERT or UPDATE on STAGE_MODERN_MICRO_DEPOSIT
+
+  1. If INSERT and Md_Status = 'InProgress':
+     a. Lookup credit account and verification data from STAGE_ACH_MODERN_EXT_BANK_ACCOUNT
+     b. Fetch the associated legacy bank account from `t_bav_bank_account` using routing/account
+     c. Fetch BAV user details from `t_bav_user`
+
+  2. Create Work Case and Audit Logs:
+     - Generate reference number via `fn_ref_num_seq`
+     - Insert a new record in `t_uc` with type 'MicroDeposit Verification'
+     - Add audit entries in `t_uc_audit` indicating:
+       - Work case created
+       - Verification started for the account
+       - Status marked as pending
+
+  3. Insert Verification Record:
+     - Insert a new row into `t_bav_bank_account_verification`:
+       - Type = 'MicroDeposit'
+       - Work case ID
+       - Channel and agent from staging
+       - Result = NULL (pending)
+     - Capture new `bank_account_verification_id`
+
+  4. Insert Micro-Deposit Transactions:
+     - 2 credits (mdamount1, mdamount2)
+     - 1 debit (sum of the two amounts)
+     - Inserted into `t_bav_md_verification_transaction`
+
+  5. Map Modern to Legacy:
+     - Update `legacy_modern_ext_acct_map` to link MODERN_MICRO_DEPOSIT_ID with LEGACY_MICRO_DEPOSIT_ID
+
 
 
