@@ -5,14 +5,15 @@ CREATE OR REPLACE TRIGGER ODS_STG.TRIG_INS_T_BAV_MD_VERIFICATION_ATTEMPT
   FOR EACH ROW
 
 DECLARE
-PRAGMA autonomous_transaction;
+PRAGMA autonomous_transaction;  -- Allows trigger to run in its own transaction, independent of the firing DML
+
   ---------------------------------------------------------------------------
   -- Cursor to get the verification locking details for the inserted attempt
   ---------------------------------------------------------------------------
   CURSOR cs_locking IS
     SELECT id, bank_account_verification_id  
     FROM ach.t_bav_md_verification_locking
-    WHERE id = :NEW.VERIFICATION_LOCKING_ID;
+    WHERE id = :NEW.VERIFICATION_LOCKING_ID;  -- Fetch related verification_locking row
 
   cs_locking_rec cs_locking%ROWTYPE;
 
@@ -22,8 +23,7 @@ PRAGMA autonomous_transaction;
   CURSOR cs_attempts IS
     SELECT count(*) as attempts
     FROM ach.t_bav_md_verification_attempt
-    WHERE verification_locking_id = :NEW.VERIFICATION_LOCKING_ID;
-   -- GROUP BY verification_locking_id, TRUNC(:NEW.CREATED_DATE); 
+    WHERE verification_locking_id = :NEW.VERIFICATION_LOCKING_ID;  -- Total attempts for this lock
 
   cs_attempts_rec cs_attempts%ROWTYPE;
 
@@ -36,21 +36,22 @@ PRAGMA autonomous_transaction;
     FROM ach.t_bav_bank_account_verification
     WHERE bank_account_verification_id = p_bank_account_verification_id
     ORDER BY created_date DESC
-    FETCH FIRST 1 ROWS ONLY;
+    FETCH FIRST 1 ROWS ONLY; -- Get most recent verification for this ID
 
   ---------------------------------------------------------------------------
   -- Cursor to fetch bank account details by bank account ID
   ---------------------------------------------------------------------------
   CURSOR cs_bav_bank_account (p_bank_accoun_id NUMBER) IS
-    SELECT ID, ABA_NUMBER, ACCOUNT_NUMBER,CASE TO_CHAR(account_type) WHEN 'Checking' THEN 'CHK' ELSE 'SAV' END AS account_type 
+    SELECT ID, ABA_NUMBER, ACCOUNT_NUMBER,
+           CASE TO_CHAR(account_type) WHEN 'Checking' THEN 'CHK' ELSE 'SAV' END AS account_type 
     FROM ach.t_bav_bank_account 
-    where id = p_bank_accoun_id;
+    WHERE id = p_bank_accoun_id;  -- Get routing/account for this bank account
 
   ---------------------------------------------------------------------------
   -- Cursor to fetch customer ID from credit account ID
   ---------------------------------------------------------------------------
   CURSOR cs_customer(p_credit_account_id NUMBER) IS
-    SELECT customer_id FROM t_credit_account WHERE credit_account_id = p_credit_account_id;
+    SELECT customer_id FROM t_credit_account WHERE credit_account_id = p_credit_account_id; -- Get legacy customer ID
 
   ---------------------------------------------------------------------------
   -- Cursor to fetch micro-deposit amounts, pivoted by row number
@@ -61,7 +62,7 @@ PRAGMA autonomous_transaction;
              ROW_NUMBER() OVER (PARTITION BY bank_account_verification_id ORDER BY created_date) rnum
       FROM ach.T_BAV_MD_VERIFICATION_TRANSACTION
       WHERE bank_account_verification_id = p_bav_id
-    ) PIVOT (SUM(amount) FOR rnum IN (1 AS mdamount1, 2 AS mdamount2, 3 AS mdamount3));
+    ) PIVOT (SUM(amount) FOR rnum IN (1 AS mdamount1, 2 AS mdamount2, 3 AS mdamount3)); -- Get up to 3 micro-deposit amounts
 
   ---------------------------------------------------------------------------
   -- Cursor to fetch micro-deposit statuses, pivoted by row number
@@ -72,7 +73,7 @@ PRAGMA autonomous_transaction;
              ROW_NUMBER() OVER (PARTITION BY bank_account_verification_id ORDER BY created_date) rnum
       FROM ach.T_BAV_MD_VERIFICATION_TRANSACTION
       WHERE bank_account_verification_id = p_bav_id
-    ) PIVOT (MAX(status) FOR rnum IN (1 AS md1_status, 2 AS md2_status, 3 AS md3_status));
+    ) PIVOT (MAX(status) FOR rnum IN (1 AS md1_status, 2 AS md2_status, 3 AS md3_status)); -- Get status for each micro-deposit
 
   ---------------------------------------------------------------------------
   -- Cursor to fetch micro-deposit creation timestamps, pivoted
@@ -83,7 +84,8 @@ PRAGMA autonomous_transaction;
              ROW_NUMBER() OVER (PARTITION BY bank_account_verification_id ORDER BY created_date) rnum
       FROM ach.T_BAV_MD_VERIFICATION_TRANSACTION
       WHERE bank_account_verification_id = p_bav_id
-    ) PIVOT (MAX(created_date) FOR rnum IN (1 AS md1_created_timestamp, 2 AS md2_created_timestamp, 3 AS md3_created_timestamp));
+    ) PIVOT (MAX(created_date) FOR rnum IN (1 AS md1_created_timestamp, 2 AS md2_created_timestamp, 3 AS md3_created_timestamp)); -- Timestamps for up to 3 micro-deposits
+
   ---------------------------------------------------------------------------
   -- Record variables to hold data from cursors
   ---------------------------------------------------------------------------
@@ -126,15 +128,15 @@ BEGIN
   ---------------------------------------------------------------------------
   -- Step 1: Fetch verification locking and BAV details
   ---------------------------------------------------------------------------
-  OPEN cs_locking;
-  FETCH cs_locking INTO cs_locking_rec;
+  OPEN cs_locking;  -- Open cursor to get locking details
+  FETCH cs_locking INTO cs_locking_rec;  -- Get the locking row into local variable
   CLOSE cs_locking;
 
   -- Capture timestamp in PST timezone
-  SELECT SYSTIMESTAMP AT TIME ZONE 'PST' INTO v_Change_timestamp_pst FROM dual;
+  SELECT SYSTIMESTAMP AT TIME ZONE 'PST' INTO v_Change_timestamp_pst FROM dual;  -- Used for auditing
 
   -- Fetch BAV details using verification ID
-  OPEN cs_bav_bank_verification(cs_locking_rec.bank_account_verification_id);
+  OPEN cs_bav_bank_verification(cs_locking_rec.bank_account_verification_id);  -- Open for most recent BAV row
   FETCH cs_bav_bank_verification INTO 
     v_bank_account_verification_id, v_verification_type, v_verified_date,
     v_result, v_channel, v_agent, v_created_date, v_credit_account_id,
@@ -142,7 +144,7 @@ BEGIN
   CLOSE cs_bav_bank_verification;
 
   -- Fetch bank account details
-  OPEN cs_bav_bank_account(v_bank_account_id);
+  OPEN cs_bav_bank_account(v_bank_account_id); -- Get bank/routing/account/type
   FETCH cs_bav_bank_account INTO cs_bav_bank_account_rec;
   CLOSE cs_bav_bank_account;  
   
@@ -151,23 +153,22 @@ BEGIN
   ---------------------------------------------------------------------------
   IF (v_verification_type IN ('Initial', 'Ews') AND v_result = 'Pass') THEN
     v_result_new := 'ACTIVE';
-    v_verification_type_new := 'EWS';
+    v_verification_type_new := 'EWS';  -- Mark as EWS verified if passed
     ELSIF ((v_verification_type = 'MicroDeposit' AND NVL(v_result, 'X') = 'Pass') or (v_verification_type = 'MicroDeposit' AND v_verified_date is not null)) THEN
-  -- ELSIF (v_verification_type = 'MicroDeposit' AND NVL(v_result, 'X') = 'Pass') THEN
     v_result_new := 'ACTIVE';
-    v_verification_type_new := 'MICRODEPOSIT';
+    v_verification_type_new := 'MICRODEPOSIT';  -- Mark as active via micro-deposit
   ELSIF (v_verification_type = 'MicroDeposit') THEN
     v_result_new := 'PENDING_ACH_VALIDATION';
-    v_verification_type_new := 'MICRODEPOSIT';
+    v_verification_type_new := 'MICRODEPOSIT'; -- Still pending micro-deposit
   ELSIF (v_verification_type = 'Yodlee' AND v_result = 'Pass') THEN
     v_result_new := 'ACTIVE';
-    v_verification_type_new := 'YODLEE';
+    v_verification_type_new := 'YODLEE';  -- Yodlee verification passed
   ELSIF (v_verification_type = 'Yodlee') THEN
     v_result_new := 'PENDING_ACH_VALIDATION';
-    v_verification_type_new := 'YODLEE';
+    v_verification_type_new := 'YODLEE'; -- Yodlee verification still pending
   END IF;
 
-  -- Assign other values to new variables
+  -- Assign other values to new variables for staging
   v_verified_date_new := v_verified_date;
   v_channel_new := v_channel;
   v_agent_new := v_agent;
@@ -184,135 +185,133 @@ BEGIN
     OPEN cs_md_status(v_bank_account_verification_id); FETCH cs_md_status INTO cs_md_status_rec; CLOSE cs_md_status;
     OPEN cs_md_ts(v_bank_account_verification_id); FETCH cs_md_ts INTO cs_md_ts_rec; CLOSE cs_md_ts;
     OPEN cs_attempts; FETCH cs_attempts INTO cs_attempts_rec; CLOSE cs_attempts;
-
   END IF;
+
 BEGIN
   SELECT IS_PRIMARY INTO v_Is_Primary
   FROM account.t_customer_bank_account
   WHERE Customer_id = cs_customer_rec.customer_id
     AND ROUTING_NUMBER = cs_bav_bank_account_rec.aba_number
     AND ACCOUNT_NUMBER = cs_bav_bank_account_rec.account_number;
-     -- AND ACCOUNT_TYPE_ID = (CASE WHEN cs_bav_bank_account_rec.account_type = 'Checking' THEN '1' ELSE '2' END)
+    -- Get IS_PRIMARY flag for this bank account for this customer
 EXCEPTION
   WHEN NO_DATA_FOUND THEN
-    v_Is_Primary := NULL; -- or default value like 0, depending on your downstream logic
+    v_Is_Primary := NULL; -- If not found, treat as not primary
 END;
   
- 
-     
   ---------------------------------------------------------------------------
   -- Step 4: Insert/Update into staging table based on migration status
   ---------------------------------------------------------------------------
   IF INSERTING THEN
     IF v_is_migrated != 2 THEN
-      -- For non-migrated BAVs, update existing staging records
+      -- For non-migrated BAVs, update existing staging records in external account table
       UPDATE ods_stg.STAGE_ACH_EXT_BANK_ACCOUNT
       SET locked = CASE WHEN cs_attempts_rec.attempts = 2 THEN 'Y' ELSE 'N' END,
           verification_attempts = CASE WHEN cs_attempts_rec.attempts IS NULL 
                                        THEN 1 ELSE NVL(cs_attempts_rec.attempts, 0) + 1 END
       WHERE account_id = v_bank_account_id
         AND credit_account_id = v_credit_account_id;
-        commit;
+      commit; -- Commit as this is autonomous
     ELSE
       BEGIN
-      Select VERIFICATION_ATTEMPTS, LOCKED INTO v_attempts_from_staging, v_locked_from_staging
-      FROM ODS_STG.STAGE_MODERN_MICRO_DEPOSIT
-      Where LEGACY_CUSTOMER_ID = cs_customer_rec.customer_id
+        -- For migrated accounts, fetch attempts and locked info from modern staging
+        Select VERIFICATION_ATTEMPTS, LOCKED INTO v_attempts_from_staging, v_locked_from_staging
+        FROM ODS_STG.STAGE_MODERN_MICRO_DEPOSIT
+        Where LEGACY_CUSTOMER_ID = cs_customer_rec.customer_id
           and ROUTING_NUMBER = cs_bav_bank_account_rec.aba_number
           and ACCOUNT_NUMBER = cs_bav_bank_account_rec.account_number
           and ACCOUNT_TYPE = cs_bav_bank_account_rec.account_type;
       EXCEPTION
          WHEN NO_DATA_FOUND THEN
           v_attempts_from_staging := NULL;
-          v_locked_from_staging := NULL;  -- or default value like 0, depending on your downstream logic
+          v_locked_from_staging := NULL;  -- Default/null if not found
       END;
      
       IF :NEW.CHANNEL <> 'CASH' THEN
-    -- For migrated accounts, insert or update via MERGE into staging table
-            MERGE INTO ods_stg.STAGE_ACH_EXT_BANK_ACCOUNT tgt
-            USING (
-              SELECT
-                cs_customer_rec.customer_id AS legacy_customer_id,
-                v_bank_account_id_new AS account_id,
-                v_credit_account_id_new AS credit_account_id,
-                cs_bav_bank_account_rec.aba_number AS ROUTING_NUMBER,
-                cs_bav_bank_account_rec.account_number AS ACCOUNT_NUMBER,
-                cs_bav_bank_account_rec.account_type AS ACCOUNT_TYPE,
-                v_result_new AS result,
-                v_agent_new AS agent,
-                v_channel_new AS channel,
-                v_verification_type_new AS verification_type,
-                v_verified_date_new AS verified_date,
-                cs_md_rec.mdamount1 AS mdamount1,
-                cs_md_rec.mdamount2 AS mdamount2,
-                cs_md_rec.mdamount3 AS mdamount3,
-                cs_md_status_rec.md1_status AS md1_status,
-                cs_md_status_rec.md2_status AS md2_status,
-                cs_md_status_rec.md3_status AS md3_status,
-                cs_md_ts_rec.md1_created_timestamp AS md1_created_timestamp,
-                cs_md_ts_rec.md2_created_timestamp AS md2_created_timestamp,
-                cs_md_ts_rec.md3_created_timestamp AS md3_created_timestamp,
-                CASE WHEN cs_attempts_rec.attempts = 2 THEN 'Y' ELSE 'N' END AS locked,
-                CASE WHEN cs_attempts_rec.attempts IS NULL THEN 1 ELSE NVL(cs_attempts_rec.attempts, 0) + 1 END AS verification_attempts,
-                v_Change_timestamp_pst + INTERVAL '0 00:00:00.000011' DAY TO SECOND(6) AS change_timestamp,
-                v_agent_new AS created_by,
-                v_created_date_new AS created_timestamp,
-                v_agent_new AS updated_by,
-                v_Change_timestamp_pst AS updated_timestamp,
-                v_Is_Primary as IS_PRIMARY
-              FROM dual
-            ) src
-            ON (tgt.account_id = src.account_id and tgt.legacy_customer_id = src.legacy_customer_id and tgt.credit_account_id = src.credit_account_id and tgt.ROUTING_NUMBER = src.ROUTING_NUMBER and tgt.ACCOUNT_NUMBER = src.ACCOUNT_NUMBER)
-            WHEN MATCHED THEN
-              UPDATE SET
-                tgt.ACCOUNT_TYPE = src.ACCOUNT_TYPE,
-                tgt.result = src.result,
-                tgt.agent = src.agent,
-                tgt.channel = src.channel,
-                tgt.verification_type = src.verification_type,
-                tgt.verified_date = src.verified_date,
-                tgt.mdamount1 = src.mdamount1,
-                tgt.mdamount2 = src.mdamount2,
-                tgt.mdamount3 = src.mdamount3,
-                tgt.md1_status = src.md1_status,
-                tgt.md2_status = src.md2_status,
-                tgt.md3_status = src.md3_status,
-                tgt.md1_created_timestamp = src.md1_created_timestamp,
-                tgt.md2_created_timestamp = src.md2_created_timestamp,
-                tgt.md3_created_timestamp = src.md3_created_timestamp,
-                tgt.locked = src.locked,
-                tgt.verification_attempts = src.verification_attempts,
-                tgt.change_timestamp = src.change_timestamp,
-                tgt.updated_by = src.updated_by,
-                tgt.updated_timestamp = src.updated_timestamp,
-                tgt.IS_PRIMARY = src.IS_PRIMARY
-                
-            WHEN NOT MATCHED THEN
-              INSERT (
-                legacy_customer_id, account_id, credit_account_id, ROUTING_NUMBER, ACCOUNT_NUMBER,ACCOUNT_TYPE,
-                result, agent, channel, verification_type, verified_date,
-                mdamount1, mdamount2, mdamount3,
-                md1_status, md2_status, md3_status,
-                md1_created_timestamp, md2_created_timestamp, md3_created_timestamp,
-                locked, verification_attempts, change_timestamp,
-                created_by, created_timestamp, updated_by, updated_timestamp,IS_PRIMARY
-              )
-              VALUES (
-                src.legacy_customer_id, src.account_id, src.credit_account_id, src.ROUTING_NUMBER, src.ACCOUNT_NUMBER,src.ACCOUNT_TYPE,
-                src.result, src.agent, src.channel, src.verification_type, src.verified_date,
-                src.mdamount1, src.mdamount2, src.mdamount3,
-                src.md1_status, src.md2_status, src.md3_status,
-                src.md1_created_timestamp, src.md2_created_timestamp, src.md3_created_timestamp,
-                src.locked, src.verification_attempts, src.change_timestamp,
-                src.created_by, src.created_timestamp, src.updated_by, src.updated_timestamp,src.IS_PRIMARY
-              );
-                commit;
-            END IF;
-            commit;
+        -- For migrated accounts, insert or update via MERGE into staging table
+        MERGE INTO ods_stg.STAGE_ACH_EXT_BANK_ACCOUNT tgt
+        USING (
+          SELECT
+            cs_customer_rec.customer_id AS legacy_customer_id,
+            v_bank_account_id_new AS account_id,
+            v_credit_account_id_new AS credit_account_id,
+            cs_bav_bank_account_rec.aba_number AS ROUTING_NUMBER,
+            cs_bav_bank_account_rec.account_number AS ACCOUNT_NUMBER,
+            cs_bav_bank_account_rec.account_type AS ACCOUNT_TYPE,
+            v_result_new AS result,
+            v_agent_new AS agent,
+            v_channel_new AS channel,
+            v_verification_type_new AS verification_type,
+            v_verified_date_new AS verified_date,
+            cs_md_rec.mdamount1 AS mdamount1,
+            cs_md_rec.mdamount2 AS mdamount2,
+            cs_md_rec.mdamount3 AS mdamount3,
+            cs_md_status_rec.md1_status AS md1_status,
+            cs_md_status_rec.md2_status AS md2_status,
+            cs_md_status_rec.md3_status AS md3_status,
+            cs_md_ts_rec.md1_created_timestamp AS md1_created_timestamp,
+            cs_md_ts_rec.md2_created_timestamp AS md2_created_timestamp,
+            cs_md_ts_rec.md3_created_timestamp AS md3_created_timestamp,
+            CASE WHEN cs_attempts_rec.attempts = 2 THEN 'Y' ELSE 'N' END AS locked,
+            CASE WHEN cs_attempts_rec.attempts IS NULL THEN 1 ELSE NVL(cs_attempts_rec.attempts, 0) + 1 END AS verification_attempts,
+            v_Change_timestamp_pst + INTERVAL '0 00:00:00.000011' DAY TO SECOND(6) AS change_timestamp,
+            v_agent_new AS created_by,
+            v_created_date_new AS created_timestamp,
+            v_agent_new AS updated_by,
+            v_Change_timestamp_pst AS updated_timestamp,
+            v_Is_Primary as IS_PRIMARY
+          FROM dual
+        ) src
+        ON (tgt.account_id = src.account_id and tgt.legacy_customer_id = src.legacy_customer_id and tgt.credit_account_id = src.credit_account_id and tgt.ROUTING_NUMBER = src.ROUTING_NUMBER and tgt.ACCOUNT_NUMBER = src.ACCOUNT_NUMBER)
+        WHEN MATCHED THEN
+          UPDATE SET
+            tgt.ACCOUNT_TYPE = src.ACCOUNT_TYPE,
+            tgt.result = src.result,
+            tgt.agent = src.agent,
+            tgt.channel = src.channel,
+            tgt.verification_type = src.verification_type,
+            tgt.verified_date = src.verified_date,
+            tgt.mdamount1 = src.mdamount1,
+            tgt.mdamount2 = src.mdamount2,
+            tgt.mdamount3 = src.mdamount3,
+            tgt.md1_status = src.md1_status,
+            tgt.md2_status = src.md2_status,
+            tgt.md3_status = src.md3_status,
+            tgt.md1_created_timestamp = src.md1_created_timestamp,
+            tgt.md2_created_timestamp = src.md2_created_timestamp,
+            tgt.md3_created_timestamp = src.md3_created_timestamp,
+            tgt.locked = src.locked,
+            tgt.verification_attempts = src.verification_attempts,
+            tgt.change_timestamp = src.change_timestamp,
+            tgt.updated_by = src.updated_by,
+            tgt.updated_timestamp = src.updated_timestamp,
+            tgt.IS_PRIMARY = src.IS_PRIMARY
+        WHEN NOT MATCHED THEN
+          INSERT (
+            legacy_customer_id, account_id, credit_account_id, ROUTING_NUMBER, ACCOUNT_NUMBER,ACCOUNT_TYPE,
+            result, agent, channel, verification_type, verified_date,
+            mdamount1, mdamount2, mdamount3,
+            md1_status, md2_status, md3_status,
+            md1_created_timestamp, md2_created_timestamp, md3_created_timestamp,
+            locked, verification_attempts, change_timestamp,
+            created_by, created_timestamp, updated_by, updated_timestamp,IS_PRIMARY
+          )
+          VALUES (
+            src.legacy_customer_id, src.account_id, src.credit_account_id, src.ROUTING_NUMBER, src.ACCOUNT_NUMBER,src.ACCOUNT_TYPE,
+            src.result, src.agent, src.channel, src.verification_type, src.verified_date,
+            src.mdamount1, src.mdamount2, src.mdamount3,
+            src.md1_status, src.md2_status, src.md3_status,
+            src.md1_created_timestamp, src.md2_created_timestamp, src.md3_created_timestamp,
+            src.locked, src.verification_attempts, src.change_timestamp,
+            src.created_by, src.created_timestamp, src.updated_by, src.updated_timestamp,src.IS_PRIMARY
+          );
+        commit; -- Commit merge for autonomous txn
+      END IF;
+      commit; -- Commit after ELSE block
     END IF;
-    commit;
+    commit; -- Commit outer INSERTING
   END IF;
-commit;
+commit; -- Final commit for autonomous txn
 
 EXCEPTION
   -- Log error details into the trigger_log table if any exception occurs
@@ -337,5 +336,5 @@ EXCEPTION
       SYSTIMESTAMP,
       '', '', 'EXTERNAL_ACCOUNTS', ''
     );
-    commit;
+    commit;  -- Commit log record for error
 END;
