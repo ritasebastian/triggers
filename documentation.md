@@ -1,4 +1,4 @@
-Thanks! The section you shared is already present in the documentation and clearly formatted for GitLab. Here's how it appears with markdown rendering:
+
 
 ---
 
@@ -41,8 +41,51 @@ Thanks! The section you shared is already present in the documentation and clear
 
 ---
 
-Let me know if you want:
+ON INSERT or UPDATE on MODERN_EXT_BANK_ACCOUNT
 
-* A **diagram** showing the relationship between triggers and tables
-* A **navigation sidebar** for wiki-style GitLab browsing
-* Or **split `.md` files** for each trigger for modular documentation.
+  1. Ensure User Exists:
+     - If a user with the given LEGACY_CUSTOMER_ID is not found in `t_bav_user`,
+       fetch the full customer name from `t_primary_chd`/`t_name` and insert a new record.
+
+  2. Validate or Insert Bank Account:
+     - Check if a matching routing/account number exists in `t_bav_bank_account`.
+     - If found, update the account type.
+     - If not, insert a new bank account.
+
+  3. Get Associated Credit Card:
+     - Retrieve the current card (`current_card = 1`) for the credit account.
+
+  4. Check for Existing Customer Bank Account:
+     - Look for a matching entry in `t_customer_bank_account`.
+
+  5. If this is a **new insert** (not single-use, not already existing):
+     - If `operation_type = 'ADD'`:
+       a. Create a new Work Case (`t_uc`) with type depending on verification result.
+       b. Insert audit steps into `t_uc_audit` (e.g., method used, status).
+       c. Insert record into `t_bav_bank_account_verification` with relevant info.
+       d. If verification result = 'ACTIVE':
+          - Use context package to set a flag and:
+            - Insert customer bank account via `PKG_CUSTOMER_BANK_ACCOUNT`
+            - Record the insertion in the bank account history
+            - Create a new Work Case for ACH Registration
+            - Add audit steps including bank info and registration status
+       e. Create mapping in `LEGACY_MODERN_EXT_ACCT_MAP` table.
+
+     - If account is marked `Is_Primary = 1`:
+       - Set all existing accounts' `is_primary = 0` for this customer
+       - Set the new account's `is_primary = 1`
+       - Add entry to `t_customer_bank_account_sync` for change tracking
+
+  6. If this is an **update**:
+     - When moving from `PENDING_ACH_VERIFICATION` → `PENDING_ACH_VALIDATION`:
+       - Insert the bank account and history if it doesn’t exist
+       - Create audit trail
+
+     - When moving from `PENDING_ACH_VALIDATION` → `ACTIVE`:
+       - Update the corresponding BAV record with `verified_date` and set result to `Pass`
+       - Log audit status: Verification success, platform, closed status
+
+     - If `operation_type` is `PRIMARY_UPDATE` and `Is_Primary = 1`:
+       - Similar logic to insert case: unset previous primary, set new primary, sync log
+
+
