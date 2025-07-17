@@ -1,0 +1,1 @@
+CREATE CONTEXT ods_stg_trig_ctx USING ods_stg.trig_ctx_pkg; 
